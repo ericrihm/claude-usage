@@ -3,7 +3,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
 [![claude-code](https://img.shields.io/badge/claude--code-black?style=flat-square)](https://claude.ai/code)
 
-A local dashboard for tracking your Claude Code token usage, costs, and session history. Reads the JSONL transcript files that Claude Code writes locally and visualizes them in a browser dashboard.
+**Pro and Max subscribers get a progress bar. This gives you the full picture.**
+
+Claude Code writes detailed usage logs locally — token counts, models, sessions, projects — regardless of your plan. This dashboard reads those logs and turns them into charts and cost estimates. Works on API, Pro, and Max plans.
 
 ![Claude Usage Dashboard](docs/screenshot.png)
 
@@ -13,7 +15,9 @@ A local dashboard for tracking your Claude Code token usage, costs, and session 
 
 ## What this tracks
 
-This tool reads Claude Code's local transcript files and captures usage from:
+Works on **API, Pro, and Max plans** — Claude Code writes local usage logs regardless of subscription type. This tool reads those logs and gives you visibility that Anthropic's UI doesn't provide.
+
+Captures usage from:
 - **Claude Code CLI** (`claude` command in terminal)
 - **VS Code extension** (Claude Code sidebar)
 - **Dispatched Code sessions** (sessions routed through Claude Code)
