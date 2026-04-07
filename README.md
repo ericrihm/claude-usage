@@ -28,20 +28,33 @@ This tool reads Claude Code's local transcript files and captures usage from:
 - Python 3.8+
 - No third-party packages — uses only the standard library (`sqlite3`, `http.server`, `json`, `pathlib`)
 
-## Setup
+> Anyone running Claude Code already has Python installed.
 
-```bash
-git clone https://github.com/phuryn/claude-usage
-cd claude-usage
-```
+## Quick Start
 
 No `pip install`, no virtual environment, no build step.
+
+### Windows
+```
+git clone https://github.com/phuryn/claude-usage
+cd claude-usage
+python cli.py dashboard
+```
+
+### macOS / Linux
+```
+git clone https://github.com/phuryn/claude-usage
+cd claude-usage
+python3 cli.py dashboard
+```
 
 ---
 
 ## Usage
 
-```bash
+> On macOS/Linux, use `python3` instead of `python` in all commands below.
+
+```
 # Scan JSONL files and populate the database (~/.claude/usage.db)
 python cli.py scan
 
