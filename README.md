@@ -73,9 +73,14 @@ python cli.py dashboard
 
 # Custom host and port via environment variables
 HOST=0.0.0.0 PORT=9000 python cli.py dashboard
+
+# Scan a custom projects directory
+python cli.py scan --projects-dir /path/to/transcripts
 ```
 
 The scanner is incremental — it tracks each file's path and modification time, so re-running `scan` is fast and only processes new or changed files.
+
+By default, the scanner checks both `~/.claude/projects/` and the Xcode Claude integration directory (`~/Library/Developer/Xcode/CodingAssistant/ClaudeAgentConfig/projects/`), skipping any that don't exist. Use `--projects-dir` to scan a custom location instead.
 
 ---
 
