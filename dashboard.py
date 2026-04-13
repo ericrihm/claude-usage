@@ -58,7 +58,8 @@ def get_dashboard_data(db_path=DB_PATH):
         SELECT
             session_id, project_name, first_timestamp, last_timestamp,
             total_input_tokens, total_output_tokens,
-            total_cache_read, total_cache_creation, model, turn_count
+            total_cache_read, total_cache_creation, model, turn_count,
+            git_branch
         FROM sessions
         ORDER BY last_timestamp DESC
     """).fetchall()
@@ -74,6 +75,7 @@ def get_dashboard_data(db_path=DB_PATH):
         sessions_all.append({
             "session_id":    r["session_id"][:8],
             "project":       r["project_name"] or "unknown",
+            "branch":        r["git_branch"] or "",
             "last":          (r["last_timestamp"] or "")[:16].replace("T", " "),
             "last_date":     (r["last_timestamp"] or "")[:10],
             "duration_min":  duration_min,
@@ -267,6 +269,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <tbody id="project-cost-body"></tbody>
     </table>
   </div>
+  <div class="table-card">
+    <div class="section-header"><div class="section-title">Cost by Project &amp; Branch</div><button class="export-btn" onclick="exportProjectBranchCSV()" title="Export project+branch breakdown to CSV">&#x2913; CSV</button></div>
+    <table>
+      <thead><tr>
+        <th>Project</th>
+        <th>Branch</th>
+        <th class="sortable" onclick="setProjectBranchSort('sessions')">Sessions <span class="sort-icon" id="pbsort-sessions"></span></th>
+        <th class="sortable" onclick="setProjectBranchSort('turns')">Turns <span class="sort-icon" id="pbsort-turns"></span></th>
+        <th class="sortable" onclick="setProjectBranchSort('input')">Input <span class="sort-icon" id="pbsort-input"></span></th>
+        <th class="sortable" onclick="setProjectBranchSort('output')">Output <span class="sort-icon" id="pbsort-output"></span></th>
+        <th class="sortable" onclick="setProjectBranchSort('cost')">Est. Cost <span class="sort-icon" id="pbsort-cost"></span></th>
+      </tr></thead>
+      <tbody id="project-branch-cost-body"></tbody>
+    </table>
+  </div>
 </div>
 
 <footer>
@@ -300,8 +317,11 @@ let modelSortCol = 'cost';
 let modelSortDir = 'desc';
 let projectSortCol = 'cost';
 let projectSortDir = 'desc';
+let branchSortCol = 'cost';
+let branchSortDir = 'desc';
 let lastFilteredSessions = [];
 let lastByProject = [];
+let lastByProjectBranch = [];
 let sessionSortDir = 'desc';
 
 // ── Pricing (Anthropic API, April 2026) ────────────────────────────────────
@@ -559,6 +579,22 @@ function applyFilter() {
   }
   const byProject = Object.values(projMap).sort((a, b) => (b.input + b.output) - (a.input + a.output));
 
+  // By project+branch: aggregate from filtered sessions
+  const projBranchMap = {};
+  for (const s of filteredSessions) {
+    const key = s.project + '\x00' + (s.branch || '');
+    if (!projBranchMap[key]) projBranchMap[key] = { project: s.project, branch: s.branch || '', input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, sessions: 0, cost: 0 };
+    const pb = projBranchMap[key];
+    pb.input          += s.input;
+    pb.output         += s.output;
+    pb.cache_read     += s.cache_read;
+    pb.cache_creation += s.cache_creation;
+    pb.turns          += s.turns;
+    pb.sessions++;
+    pb.cost += calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
+  }
+  const byProjectBranch = Object.values(projBranchMap).sort((a, b) => b.cost - a.cost);
+
   // Totals
   const totals = {
     sessions:       filteredSessions.length,
@@ -579,9 +615,11 @@ function applyFilter() {
   renderProjectChart(byProject);
   lastFilteredSessions = sortSessions(filteredSessions);
   lastByProject = sortProjects(byProject);
+  lastByProjectBranch = sortProjectBranch(byProjectBranch);
   renderSessionsTable(lastFilteredSessions.slice(0, 20));
   renderModelCostTable(byModel);
   renderProjectCostTable(lastByProject.slice(0, 20));
+  renderProjectBranchCostTable(lastByProjectBranch.slice(0, 20));
 }
 
 // ── Renderers ──────────────────────────────────────────────────────────────
@@ -787,6 +825,48 @@ function renderProjectCostTable(byProject) {
   }).join('');
 }
 
+// ── Project+Branch cost table sorting ────────────────────────────────────
+function setProjectBranchSort(col) {
+  if (branchSortCol === col) {
+    branchSortDir = branchSortDir === 'desc' ? 'asc' : 'desc';
+  } else {
+    branchSortCol = col;
+    branchSortDir = 'desc';
+  }
+  updateProjectBranchSortIcons();
+  applyFilter();
+}
+
+function updateProjectBranchSortIcons() {
+  document.querySelectorAll('[id^="pbsort-"]').forEach(el => el.textContent = '');
+  const icon = document.getElementById('pbsort-' + branchSortCol);
+  if (icon) icon.textContent = branchSortDir === 'desc' ? ' \u25bc' : ' \u25b2';
+}
+
+function sortProjectBranch(rows) {
+  return [...rows].sort((a, b) => {
+    const av = a[branchSortCol] ?? 0;
+    const bv = b[branchSortCol] ?? 0;
+    if (av < bv) return branchSortDir === 'desc' ? 1 : -1;
+    if (av > bv) return branchSortDir === 'desc' ? -1 : 1;
+    return 0;
+  });
+}
+
+function renderProjectBranchCostTable(rows) {
+  document.getElementById('project-branch-cost-body').innerHTML = sortProjectBranch(rows).map(pb => {
+    return `<tr>
+      <td>${esc(pb.project)}</td>
+      <td class="muted" style="font-family:monospace">${esc(pb.branch || '\u2014')}</td>
+      <td class="num">${pb.sessions}</td>
+      <td class="num">${fmt(pb.turns)}</td>
+      <td class="num">${fmt(pb.input)}</td>
+      <td class="num">${fmt(pb.output)}</td>
+      <td class="cost">${fmtCost(pb.cost)}</td>
+    </tr>`;
+  }).join('');
+}
+
 // ── CSV Export ────────────────────────────────────────────────────────────
 function csvField(val) {
   const s = String(val);
@@ -832,6 +912,14 @@ function exportProjectsCSV() {
   downloadCSV('projects', header, rows);
 }
 
+function exportProjectBranchCSV() {
+  const header = ['Project', 'Branch', 'Sessions', 'Turns', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Est. Cost'];
+  const rows = lastByProjectBranch.map(pb => {
+    return [pb.project, pb.branch, pb.sessions, pb.turns, pb.input, pb.output, pb.cache_read, pb.cache_creation, pb.cost.toFixed(4)];
+  });
+  downloadCSV('projects_by_branch', header, rows);
+}
+
 // ── Rescan ────────────────────────────────────────────────────────────────
 async function triggerRescan() {
   const btn = document.getElementById('rescan-btn');
@@ -874,6 +962,7 @@ async function loadData() {
       updateSortIcons();
       updateModelSortIcons();
       updateProjectSortIcons();
+      updateProjectBranchSortIcons();
     }
 
     applyFilter();
