@@ -121,4 +121,68 @@ Costs are calculated using **Anthropic API pricing as of April 2026** ([claude.c
 |------|---------|
 | `scanner.py` | Parses JSONL transcripts, writes to `~/.claude/usage.db` |
 | `dashboard.py` | HTTP server + single-page HTML/JS dashboard |
-| `cli.py` | `scan`, `today`, `stats`, `dashboard` commands |
+| `cli.py` | `scan`, `today`, `stats`, `alerts`, `dashboard` commands |
+| `config.py` | Loads multi-account configuration from `accounts.yaml` |
+| `alerts.py` | Threshold alerts with webhook notifications |
+
+---
+
+## Multi-Account Setup
+
+This fork adds support for tracking multiple Claude Code accounts in a single dashboard. Each account can have its own Claude data directory, plan type, and alert thresholds.
+
+### Configuration
+
+Create an `accounts.yaml` file in the project root (see `accounts.yaml.example`):
+
+```yaml
+accounts:
+  - name: personal
+    path: ~/.claude
+    plan: pro
+  - name: work
+    path: ~/.claude-work
+    plan: max_5x
+  - name: client-laptop
+    path: /mnt/c/Users/eric/.claude
+    plan: pro
+
+thresholds:
+  warn: 0.75
+  critical: 0.95
+
+webhooks:
+  - url: https://ntfy.sh/my-claude-alerts
+    on: [warn, critical]
+```
+
+If `accounts.yaml` does not exist, the tool falls back to scanning `~/.claude` as a single default account.
+
+### WSL path note
+
+On WSL2, you can mix Linux-native and Windows-mounted paths. This is useful when you run Claude Code from both WSL and Windows:
+
+- **Linux accounts:** `~/.claude`, `~/.claude-work` (resolves under `/home/<user>/`)
+- **Windows accounts:** `/mnt/c/Users/<user>/.claude` (accesses the Windows filesystem)
+
+Both path styles work in `accounts.yaml`. Paths are expanded with `Path.expanduser()`, so `~` resolves to the Linux home directory.
+
+### CLI commands
+
+```bash
+# Scan all configured accounts and update the database
+python cli.py scan
+
+# Check usage thresholds and fire webhook alerts
+python cli.py alerts
+
+# Scan + open the dashboard in your browser
+python cli.py dashboard
+```
+
+### Dashboard features
+
+- **Account filter dropdown** — view usage for a single account or all accounts combined
+- **Compare Accounts chart** — side-by-side bar chart of token usage per account with 5h / 24h / 7d window selectors
+- **Account progress strip** — header bar showing each account's usage fraction with color-coded indicators (green / yellow / red)
+- All existing features (daily charts, model breakdown, session table, CSV export) work with account filtering
