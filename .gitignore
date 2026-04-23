@@ -2,3 +2,7 @@ __pycache__/
 server.log
 accounts.yaml
 .claude/
+
+# AI assistant config
+CLAUDE.md
+.claude/
