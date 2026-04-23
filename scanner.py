@@ -34,7 +34,8 @@ def init_db(conn):
             total_cache_read        INTEGER DEFAULT 0,
             total_cache_creation    INTEGER DEFAULT 0,
             model           TEXT,
-            turn_count      INTEGER DEFAULT 0
+            turn_count      INTEGER DEFAULT 0,
+            account         TEXT DEFAULT 'default'
         );
 
         CREATE TABLE IF NOT EXISTS turns (
@@ -48,7 +49,8 @@ def init_db(conn):
             cache_creation_tokens   INTEGER DEFAULT 0,
             tool_name               TEXT,
             cwd                     TEXT,
-            message_id              TEXT
+            message_id              TEXT,
+            account                 TEXT DEFAULT 'default'
         );
 
         CREATE TABLE IF NOT EXISTS processed_files (
@@ -66,6 +68,15 @@ def init_db(conn):
         conn.execute("SELECT message_id FROM turns LIMIT 1")
     except sqlite3.OperationalError:
         conn.execute("ALTER TABLE turns ADD COLUMN message_id TEXT")
+    # Add account column if upgrading for multi-account support
+    session_cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+    if "account" not in session_cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN account TEXT DEFAULT 'default'")
+    turn_cols = {row[1] for row in conn.execute("PRAGMA table_info(turns)").fetchall()}
+    if "account" not in turn_cols:
+        conn.execute("ALTER TABLE turns ADD COLUMN account TEXT DEFAULT 'default'")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_turns_account ON turns(account)")
     # Conditional unique index: only dedup non-null message IDs
     conn.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_message_id
@@ -222,7 +233,7 @@ def aggregate_sessions(session_metas, turns):
     return result
 
 
-def upsert_sessions(conn, sessions):
+def upsert_sessions(conn, sessions, account="default"):
     for s in sessions:
         # Check if session exists
         existing = conn.execute(
@@ -236,14 +247,15 @@ def upsert_sessions(conn, sessions):
                 INSERT INTO sessions
                     (session_id, project_name, first_timestamp, last_timestamp,
                      git_branch, total_input_tokens, total_output_tokens,
-                     total_cache_read, total_cache_creation, model, turn_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     total_cache_read, total_cache_creation, model, turn_count,
+                     account)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 s["session_id"], s["project_name"], s["first_timestamp"],
                 s["last_timestamp"], s["git_branch"],
                 s["total_input_tokens"], s["total_output_tokens"],
                 s["total_cache_read"], s["total_cache_creation"],
-                s["model"], s["turn_count"]
+                s["model"], s["turn_count"], account
             ))
         else:
             # Update: add new tokens on top of existing (since we only insert new turns)
@@ -255,33 +267,35 @@ def upsert_sessions(conn, sessions):
                     total_cache_read = total_cache_read + ?,
                     total_cache_creation = total_cache_creation + ?,
                     turn_count = turn_count + ?,
-                    model = COALESCE(?, model)
+                    model = COALESCE(?, model),
+                    account = ?
                 WHERE session_id = ?
             """, (
                 s["last_timestamp"],
                 s["total_input_tokens"], s["total_output_tokens"],
                 s["total_cache_read"], s["total_cache_creation"],
-                s["turn_count"], s["model"],
+                s["turn_count"], s["model"], account,
                 s["session_id"]
             ))
 
 
-def insert_turns(conn, turns):
+def insert_turns(conn, turns, account="default"):
     conn.executemany("""
         INSERT OR IGNORE INTO turns
             (session_id, timestamp, model, input_tokens, output_tokens,
-             cache_read_tokens, cache_creation_tokens, tool_name, cwd, message_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             cache_read_tokens, cache_creation_tokens, tool_name, cwd, message_id,
+             account)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, [
         (t["session_id"], t["timestamp"], t["model"],
          t["input_tokens"], t["output_tokens"],
          t["cache_read_tokens"], t["cache_creation_tokens"],
-         t["tool_name"], t["cwd"], t.get("message_id", ""))
+         t["tool_name"], t["cwd"], t.get("message_id", ""), account)
         for t in turns
     ])
 
 
-def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
+def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True, account="default"):
     conn = get_db(db_path)
     init_db(conn)
 
@@ -333,8 +347,8 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
 
             if turns or session_metas:
                 sessions = aggregate_sessions(session_metas, turns)
-                upsert_sessions(conn, sessions)
-                insert_turns(conn, turns)
+                upsert_sessions(conn, sessions, account=account)
+                insert_turns(conn, turns, account=account)
                 for s in sessions:
                     total_sessions.add(s["session_id"])
                 total_turns += len(turns)
@@ -442,8 +456,8 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
 
             if new_turns or new_session_metas:
                 sessions = aggregate_sessions(list(new_session_metas.values()), new_turns)
-                upsert_sessions(conn, sessions)
-                insert_turns(conn, new_turns)
+                upsert_sessions(conn, sessions, account=account)
+                insert_turns(conn, new_turns, account=account)
                 for s in sessions:
                     total_sessions.add(s["session_id"])
                 total_turns += len(new_turns)
@@ -481,6 +495,82 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
     conn.close()
     return {"new": new_files, "updated": updated_files, "skipped": skipped_files,
             "turns": total_turns, "sessions": len(total_sessions)}
+
+
+def scan_all(config, db_path=DB_PATH, verbose=True):
+    """Scan all accounts defined in config.
+
+    Loops over config["accounts"], resolves each account's projects
+    directory, calls scan() per account, and prints a summary table.
+
+    Raises ValueError if two accounts share the same projects directory.
+    """
+    accounts = config.get("accounts", [])
+    if not accounts:
+        # Fallback: scan default ~/.claude/projects
+        result = scan(db_path=db_path, verbose=verbose)
+        result["account"] = "default"
+        return [result]
+
+    # Assert configured paths are disjoint
+    seen_dirs = {}
+    for acct in accounts:
+        projects_path = str(Path(acct["path"]).expanduser() / "projects")
+        if projects_path in seen_dirs:
+            raise ValueError(
+                f"Overlapping projects directory: {projects_path} "
+                f"is used by both '{seen_dirs[projects_path]}' and '{acct['name']}'"
+            )
+        seen_dirs[projects_path] = acct["name"]
+
+    results = []
+    for acct in accounts:
+        name = acct.get("name", "default")
+        base_path = Path(acct["path"]).expanduser()
+        projects_path = base_path / "projects"
+
+        if verbose:
+            print(f"\n{'=' * 60}")
+            print(f"  Account: {name}")
+            print(f"  Path:    {projects_path}")
+            print(f"{'=' * 60}")
+
+        if not projects_path.exists():
+            if verbose:
+                print(f"  (projects directory does not exist, skipping)")
+            results.append({
+                "account": name,
+                "new": 0, "updated": 0, "skipped": 0, "turns": 0, "sessions": 0,
+            })
+            continue
+
+        result = scan(
+            projects_dir=projects_path,
+            db_path=db_path,
+            verbose=verbose,
+            account=name,
+        )
+        result["account"] = name
+        results.append(result)
+
+    # Print summary table
+    if verbose and len(accounts) > 1:
+        print(f"\n{'=' * 60}")
+        print(f"  {'ACCOUNT':<20} {'NEW':>5} {'UPD':>5} {'SKIP':>5} {'TURNS':>6}")
+        print(f"  {'-' * 20} {'-' * 5} {'-' * 5} {'-' * 5} {'-' * 6}")
+        for r in results:
+            print(f"  {r['account']:<20} {r['new']:>5} {r['updated']:>5} "
+                  f"{r['skipped']:>5} {r['turns']:>6}")
+        totals_new = sum(r["new"] for r in results)
+        totals_upd = sum(r["updated"] for r in results)
+        totals_skip = sum(r["skipped"] for r in results)
+        totals_turns = sum(r["turns"] for r in results)
+        print(f"  {'-' * 20} {'-' * 5} {'-' * 5} {'-' * 5} {'-' * 6}")
+        print(f"  {'TOTAL':<20} {totals_new:>5} {totals_upd:>5} "
+              f"{totals_skip:>5} {totals_turns:>6}")
+        print(f"{'=' * 60}")
+
+    return results
 
 
 if __name__ == "__main__":

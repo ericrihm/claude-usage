@@ -8,24 +8,91 @@ import sqlite3
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import urlparse, parse_qs
+
+from config import load_config
 
 DB_PATH = Path.home() / ".claude" / "usage.db"
+CONFIG = load_config()
 
 
-def get_dashboard_data(db_path=DB_PATH):
+def _account_where(account, table_alias=""):
+    """Return (sql_fragment, params) for account filtering.
+
+    account='all' or None → no filter.  Otherwise filter to exact name.
+    """
+    if not account or account == "all":
+        return "", []
+    col = f"{table_alias}.account" if table_alias else "account"
+    return f" AND {col} = ?", [account]
+
+
+def get_accounts(db_path=DB_PATH):
+    """Return sorted list of distinct account names from the DB."""
+    if not db_path.exists():
+        return []
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute("SELECT DISTINCT account FROM sessions ORDER BY account").fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
+def get_compare_data(window="5h", db_path=DB_PATH):
+    """Return per-account aggregates for the given time window.
+
+    Returns list of dicts: [{account, input, output, cache_read,
+    cache_creation, cost_usd, session_count}]
+    """
+    if not db_path.exists():
+        return []
+
+    cutoffs = {"5h": "-5 hours", "24h": "-24 hours", "7d": "-7 days"}
+    offset = cutoffs.get(window, "-5 hours")
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("""
+        SELECT
+            COALESCE(account, 'default') as account,
+            SUM(input_tokens)            as input,
+            SUM(output_tokens)           as output,
+            SUM(cache_read_tokens)       as cache_read,
+            SUM(cache_creation_tokens)   as cache_creation,
+            COUNT(DISTINCT session_id)   as session_count
+        FROM turns
+        WHERE timestamp >= datetime('now', ?)
+        GROUP BY account
+        ORDER BY account
+    """, (offset,)).fetchall()
+    conn.close()
+
+    return [{
+        "account":        r["account"],
+        "input":          r["input"] or 0,
+        "output":         r["output"] or 0,
+        "cache_read":     r["cache_read"] or 0,
+        "cache_creation": r["cache_creation"] or 0,
+        "session_count":  r["session_count"] or 0,
+    } for r in rows]
+
+
+def get_dashboard_data(db_path=DB_PATH, account="all"):
     if not db_path.exists():
         return {"error": "Database not found. Run: python cli.py scan"}
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
 
+    acct_sql, acct_params = _account_where(account)
+
     # ── All models (for filter UI) ────────────────────────────────────────────
     model_rows = conn.execute("""
         SELECT COALESCE(model, 'unknown') as model
         FROM turns
+        WHERE 1=1 """ + acct_sql + """
         GROUP BY model
         ORDER BY SUM(input_tokens + output_tokens) DESC
-    """).fetchall()
+    """, acct_params).fetchall()
     all_models = [r["model"] for r in model_rows]
 
     # ── Daily per-model, ALL history (client filters by range) ────────────────
@@ -39,9 +106,10 @@ def get_dashboard_data(db_path=DB_PATH):
             SUM(cache_creation_tokens) as cache_creation,
             COUNT(*)                   as turns
         FROM turns
+        WHERE 1=1 """ + acct_sql + """
         GROUP BY day, model
         ORDER BY day, model
-    """).fetchall()
+    """, acct_params).fetchall()
 
     daily_by_model = [{
         "day":            r["day"],
@@ -60,8 +128,9 @@ def get_dashboard_data(db_path=DB_PATH):
             total_input_tokens, total_output_tokens,
             total_cache_read, total_cache_creation, model, turn_count
         FROM sessions
+        WHERE 1=1 """ + acct_sql + """
         ORDER BY last_timestamp DESC
-    """).fetchall()
+    """, acct_params).fetchall()
 
     sessions_all = []
     for r in session_rows:
@@ -116,12 +185,23 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; }
 
-  header { background: var(--card); border-bottom: 1px solid var(--border); padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; }
+  header { background: var(--card); border-bottom: 1px solid var(--border); padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
   header h1 { font-size: 18px; font-weight: 600; color: var(--accent); }
   header .meta { color: var(--muted); font-size: 12px; }
   #rescan-btn { background: var(--card); border: 1px solid var(--border); color: var(--muted); padding: 4px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; margin-top: 4px; }
   #rescan-btn:hover { color: var(--text); border-color: var(--accent); }
   #rescan-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  /* Account progress strip in header */
+  #account-strip { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; width: 100%; margin-top: 4px; }
+  .acct-bar { display: flex; align-items: center; gap: 6px; font-size: 11px; }
+  .acct-bar .acct-name { color: var(--muted); white-space: nowrap; min-width: 50px; }
+  .acct-bar .bar-track { width: 80px; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; }
+  .acct-bar .bar-fill { height: 100%; border-radius: 3px; transition: width 0.3s ease; }
+  .acct-bar .bar-fill.green { background: var(--green); }
+  .acct-bar .bar-fill.yellow { background: #fbbf24; }
+  .acct-bar .bar-fill.red { background: #f87171; }
+  .acct-bar .acct-pct { color: var(--muted); font-family: monospace; font-size: 10px; min-width: 30px; }
 
   #filter-bar { background: var(--card); border-bottom: 1px solid var(--border); padding: 10px 24px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .filter-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); white-space: nowrap; }
@@ -133,6 +213,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .model-cb-label input { display: none; }
   .filter-btn { padding: 3px 10px; border-radius: 4px; border: 1px solid var(--border); background: transparent; color: var(--muted); font-size: 11px; cursor: pointer; white-space: nowrap; }
   .filter-btn:hover { border-color: var(--accent); color: var(--text); }
+  #account-select { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; font-size: 12px; cursor: pointer; }
+  #account-select:hover { border-color: var(--accent); }
   .range-group { display: flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; flex-shrink: 0; }
   .range-btn { padding: 4px 13px; background: transparent; border: none; border-right: 1px solid var(--border); color: var(--muted); font-size: 12px; cursor: pointer; transition: background 0.15s, color 0.15s; }
   .range-btn:last-child { border-right: none; }
@@ -152,6 +234,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .chart-card h2 { font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 16px; }
   .chart-wrap { position: relative; height: 240px; }
   .chart-wrap.tall { height: 300px; }
+
+  /* Compare section */
+  .compare-header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+  .compare-header h2 { margin-bottom: 0; }
+  .window-group { display: flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; flex-shrink: 0; }
+  .window-btn { padding: 3px 12px; background: transparent; border: none; border-right: 1px solid var(--border); color: var(--muted); font-size: 11px; cursor: pointer; transition: background 0.15s, color 0.15s; }
+  .window-btn:last-child { border-right: none; }
+  .window-btn:hover { background: rgba(255,255,255,0.04); color: var(--text); }
+  .window-btn.active { background: rgba(79,142,247,0.15); color: var(--blue); font-weight: 600; }
 
   table { width: 100%; border-collapse: collapse; }
   th { text-align: left; padding: 8px 12px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); border-bottom: 1px solid var(--border); white-space: nowrap; }
@@ -188,9 +279,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <h1>Claude Code Usage Dashboard</h1>
   <div class="meta" id="meta">Loading...</div>
   <button id="rescan-btn" onclick="triggerRescan()" title="Rebuild the database from scratch by re-scanning all JSONL files. Use if data looks stale or costs seem wrong.">&#x21bb; Rescan</button>
+  <div id="account-strip"></div>
 </header>
 
 <div id="filter-bar">
+  <div class="filter-label">Account</div>
+  <select id="account-select" onchange="onAccountChange(this.value)">
+    <option value="all">All Accounts</option>
+  </select>
+  <div class="filter-sep"></div>
   <div class="filter-label">Models</div>
   <div id="model-checkboxes"></div>
   <button class="filter-btn" onclick="selectAllModels()">All</button>
@@ -207,6 +304,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 <div class="container">
   <div class="stats-row" id="stats-row"></div>
+
+  <!-- Compare Accounts section -->
+  <div class="chart-card wide" id="compare-section" style="margin-bottom: 24px;">
+    <div class="compare-header">
+      <h2>Compare Accounts</h2>
+      <div class="window-group">
+        <button class="window-btn active" data-window="5h"  onclick="setCompareWindow('5h')">5h</button>
+        <button class="window-btn"        data-window="24h" onclick="setCompareWindow('24h')">24h</button>
+        <button class="window-btn"        data-window="7d"  onclick="setCompareWindow('7d')">7d</button>
+      </div>
+    </div>
+    <div class="chart-wrap" id="compare-wrap"><canvas id="chart-compare"></canvas></div>
+  </div>
+
   <div class="charts-grid">
     <div class="chart-card wide">
       <h2 id="daily-chart-title">Daily Token Usage</h2>
@@ -292,8 +403,11 @@ function esc(s) {
 
 // ── State ──────────────────────────────────────────────────────────────────
 let rawData = null;
+let allAccounts = [];
+let selectedAccount = 'all';
 let selectedModels = new Set();
 let selectedRange = '30d';
+let compareWindow = '5h';
 let charts = {};
 let sessionSortCol = 'last';
 let modelSortCol = 'cost';
@@ -303,6 +417,9 @@ let projectSortDir = 'desc';
 let lastFilteredSessions = [];
 let lastByProject = [];
 let sessionSortDir = 'desc';
+
+// ── Config (injected from Python) ──────────────────────────────────────────
+const THRESHOLDS = __THRESHOLDS_JSON__;
 
 // ── Pricing (Anthropic API, April 2026) ────────────────────────────────────
 const PRICING = {
@@ -381,6 +498,10 @@ function readURLRange() {
   return ['7d', '30d', '90d', 'all'].includes(p) ? p : '30d';
 }
 
+function readURLAccount() {
+  return new URLSearchParams(window.location.search).get('account') || 'all';
+}
+
 function setRange(range) {
   selectedRange = range;
   document.querySelectorAll('.range-btn').forEach(btn =>
@@ -388,6 +509,20 @@ function setRange(range) {
   );
   updateURL();
   applyFilter();
+}
+
+// ── Account filter ─────────────────────────────────────────────────────────
+function onAccountChange(value) {
+  selectedAccount = value;
+  updateURL();
+  loadData();
+}
+
+function buildAccountDropdown(accounts) {
+  allAccounts = accounts;
+  const sel = document.getElementById('account-select');
+  sel.innerHTML = '<option value="all">All Accounts</option>' +
+    accounts.map(a => `<option value="${esc(a)}" ${a === selectedAccount ? 'selected' : ''}>${esc(a)}</option>`).join('');
 }
 
 // ── Model filter ───────────────────────────────────────────────────────────
@@ -454,6 +589,7 @@ function clearAllModels() {
 function updateURL() {
   const allModels = Array.from(document.querySelectorAll('#model-checkboxes input')).map(cb => cb.value);
   const params = new URLSearchParams();
+  if (selectedAccount !== 'all') params.set('account', selectedAccount);
   if (selectedRange !== '30d') params.set('range', selectedRange);
   if (!isDefaultModelSelection(allModels)) params.set('models', Array.from(selectedModels).join(','));
   const search = params.toString() ? '?' + params.toString() : '';
@@ -832,6 +968,77 @@ function exportProjectsCSV() {
   downloadCSV('projects', header, rows);
 }
 
+// ── Compare Accounts ──────────────────────────────────────────────────────
+function setCompareWindow(w) {
+  compareWindow = w;
+  document.querySelectorAll('.window-btn').forEach(btn =>
+    btn.classList.toggle('active', btn.dataset.window === w)
+  );
+  loadCompareData();
+}
+
+async function loadCompareData() {
+  try {
+    const resp = await fetch('/api/compare?window=' + encodeURIComponent(compareWindow));
+    const data = await resp.json();
+    renderCompareChart(data);
+    renderAccountStrip(data);
+  } catch(e) {
+    console.error('Compare load error:', e);
+  }
+}
+
+function renderCompareChart(data) {
+  const ctx = document.getElementById('chart-compare').getContext('2d');
+  if (charts.compare) charts.compare.destroy();
+  if (!data.length) {
+    charts.compare = null;
+    return;
+  }
+  const labels = data.map(d => d.account);
+  charts.compare = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: labels,
+      datasets: [
+        { label: 'Input',          data: data.map(d => d.input),          backgroundColor: TOKEN_COLORS.input,          stack: 'tokens' },
+        { label: 'Output',         data: data.map(d => d.output),         backgroundColor: TOKEN_COLORS.output,         stack: 'tokens' },
+        { label: 'Cache Read',     data: data.map(d => d.cache_read),     backgroundColor: TOKEN_COLORS.cache_read,     stack: 'tokens' },
+        { label: 'Cache Creation', data: data.map(d => d.cache_creation), backgroundColor: TOKEN_COLORS.cache_creation, stack: 'tokens' },
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: '#8892a4', boxWidth: 12 } } },
+      scales: {
+        x: { ticks: { color: '#8892a4' }, grid: { color: '#2a2d3a' } },
+        y: { ticks: { color: '#8892a4', callback: v => fmt(v) }, grid: { color: '#2a2d3a' } },
+      }
+    }
+  });
+}
+
+function renderAccountStrip(compareData) {
+  const strip = document.getElementById('account-strip');
+  if (!compareData || compareData.length <= 1) {
+    strip.innerHTML = '';
+    return;
+  }
+  // Find max total tokens across accounts for percentage calculation
+  const maxTokens = Math.max(...compareData.map(d => d.input + d.output + d.cache_read + d.cache_creation), 1);
+
+  strip.innerHTML = compareData.map(function(d) {
+    const total = d.input + d.output + d.cache_read + d.cache_creation;
+    const pct = Math.min(total / maxTokens * 100, 100);
+    const colorClass = pct >= THRESHOLDS.critical * 100 ? 'red' : pct >= THRESHOLDS.warn * 100 ? 'yellow' : 'green';
+    return '<div class="acct-bar">' +
+      '<span class="acct-name">' + esc(d.account) + '</span>' +
+      '<div class="bar-track"><div class="bar-fill ' + colorClass + '" style="width:' + pct.toFixed(1) + '%"></div></div>' +
+      '<span class="acct-pct">' + pct.toFixed(0) + '%</span>' +
+    '</div>';
+  }).join('');
+}
+
 // ── Rescan ────────────────────────────────────────────────────────────────
 async function triggerRescan() {
   const btn = document.getElementById('rescan-btn');
@@ -852,8 +1059,18 @@ async function triggerRescan() {
 // ── Data loading ───────────────────────────────────────────────────────────
 async function loadData() {
   try {
-    const resp = await fetch('/api/data');
-    const d = await resp.json();
+    // Build data URL with account param
+    let dataUrl = '/api/data';
+    if (selectedAccount && selectedAccount !== 'all') {
+      dataUrl += '?account=' + encodeURIComponent(selectedAccount);
+    }
+    const [dataResp, acctResp] = await Promise.all([
+      fetch(dataUrl),
+      fetch('/api/accounts'),
+    ]);
+    const d = await dataResp.json();
+    const accounts = await acctResp.json();
+
     if (d.error) {
       document.body.innerHTML = '<div style="padding:40px;color:#f87171">' + esc(d.error) + '</div>';
       return;
@@ -864,19 +1081,21 @@ async function loadData() {
     rawData = d;
 
     if (isFirstLoad) {
-      // Restore range from URL, mark active button
+      // Restore filters from URL
+      selectedAccount = readURLAccount();
       selectedRange = readURLRange();
       document.querySelectorAll('.range-btn').forEach(btn =>
         btn.classList.toggle('active', btn.dataset.range === selectedRange)
       );
-      // Build model filter (reads URL for model selection too)
       buildFilterUI(d.all_models);
       updateSortIcons();
       updateModelSortIcons();
       updateProjectSortIcons();
     }
 
+    buildAccountDropdown(accounts);
     applyFilter();
+    loadCompareData();
   } catch(e) {
     console.error(e);
   }
@@ -890,43 +1109,82 @@ setInterval(loadData, 30000);
 """
 
 
+def _render_html():
+    """Inject config thresholds into the HTML template."""
+    thresholds = CONFIG.get("thresholds", {"warn": 0.75, "critical": 0.95})
+    return HTML_TEMPLATE.replace(
+        "__THRESHOLDS_JSON__",
+        json.dumps(thresholds),
+    )
+
+
+def _parse_qs(path):
+    """Parse query string from a request path. Returns dict of key->str."""
+    parsed = urlparse(path)
+    qs = parse_qs(parsed.query)
+    return {k: v[0] for k, v in qs.items()}
+
+
+def _json_response(handler, data):
+    """Send a JSON response."""
+    body = json.dumps(data).encode("utf-8")
+    handler.send_response(200)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+    def _route_path(self):
+        """Return the path portion without query string."""
+        return urlparse(self.path).path
+
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
+        route = self._route_path()
+        params = _parse_qs(self.path)
+
+        if route in ("/", "/index.html"):
+            html = _render_html().encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
-            self.wfile.write(HTML_TEMPLATE.encode("utf-8"))
+            self.wfile.write(html)
 
-        elif self.path == "/api/data":
-            data = get_dashboard_data()
-            body = json.dumps(data).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+        elif route == "/api/accounts":
+            _json_response(self, get_accounts())
+
+        elif route == "/api/data":
+            account = params.get("account", "all")
+            data = get_dashboard_data(account=account)
+            # Run threshold alerts on each refresh tick (cheap)
+            try:
+                from alerts import check_and_fire
+                check_and_fire(CONFIG, db_path=DB_PATH)
+            except Exception:
+                pass  # Never let alert errors break the dashboard
+            _json_response(self, data)
+
+        elif route == "/api/compare":
+            window = params.get("window", "5h")
+            data = get_compare_data(window=window)
+            _json_response(self, data)
 
         else:
             self.send_response(404)
             self.end_headers()
 
     def do_POST(self):
-        if self.path == "/api/rescan":
+        if self._route_path() == "/api/rescan":
             # Full rebuild: delete DB and rescan from scratch
             if DB_PATH.exists():
                 DB_PATH.unlink()
             from scanner import scan
             result = scan(verbose=False)
-            body = json.dumps(result).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            _json_response(self, result)
         else:
             self.send_response(404)
             self.end_headers()

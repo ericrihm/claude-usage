@@ -77,8 +77,15 @@ def require_db():
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 def cmd_scan(projects_dir=None):
-    from scanner import scan
-    scan(projects_dir=Path(projects_dir) if projects_dir else None)
+    if projects_dir:
+        # Explicit --projects-dir overrides multi-account config
+        from scanner import scan
+        scan(projects_dir=Path(projects_dir))
+    else:
+        from config import load_config
+        from scanner import scan_all
+        config = load_config()
+        scan_all(config)
 
 
 def cmd_today():
@@ -260,6 +267,18 @@ def cmd_stats():
     conn.close()
 
 
+def cmd_alerts():
+    from config import load_config
+    from alerts import check_and_fire
+
+    config = load_config()
+    fired = check_and_fire(config, db_path=DB_PATH)
+    if fired:
+        print(f"Fired {fired} webhook(s).")
+    else:
+        print("No alerts triggered.")
+
+
 def cmd_dashboard(projects_dir=None):
     import webbrowser
     import threading
@@ -292,6 +311,7 @@ Usage:
   python cli.py scan [--projects-dir PATH]   Scan JSONL files and update database
   python cli.py today                        Show today's usage summary
   python cli.py stats                        Show all-time statistics
+  python cli.py alerts                       Check thresholds and fire webhooks
   python cli.py dashboard [--projects-dir PATH]  Scan + start dashboard
 """
 
@@ -299,6 +319,7 @@ COMMANDS = {
     "scan": cmd_scan,
     "today": cmd_today,
     "stats": cmd_stats,
+    "alerts": cmd_alerts,
     "dashboard": cmd_dashboard,
 }
 

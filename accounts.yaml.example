@@ -1,0 +1,21 @@
+accounts:
+  - name: acct1
+    path: ~/.claude-acct1
+    plan: max_20x
+  - name: acct2
+    path: ~/.claude-acct2
+    plan: max_5x
+  - name: acct3
+    path: /mnt/c/Users/eric/.claude-acct3
+    plan: pro
+  - name: acct4
+    path: /mnt/c/Users/eric/.claude-acct4
+    plan: pro
+
+thresholds:
+  warn: 0.75
+  critical: 0.95
+
+webhooks:
+  - url: https://ntfy.sh/my-claude-alerts
+    on: [warn, critical]
